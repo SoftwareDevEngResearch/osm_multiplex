@@ -5,6 +5,7 @@
 # third-party libraries
 import pandas as pd
 import osmnx as ox
+import numpy as np
 
 # local imports
 from . import count_data
@@ -206,5 +207,49 @@ def time_grouping(dataframe, interval='15T', time_selection='1'):
 
     datetime_df = count_data.standardize_datetime(epoch_df[['time', 'lat', 'lon', 'occupancy1', 'occupancy2']])
     grouped_time = datetime_df.groupby([pd.Grouper(key='time', freq=interval), 'lat', 'lon']).sum()
+    grouped_time['difference'] = (grouped_time['occupancy1'] - grouped_time['occupancy2']).abs()
 
     return grouped_time
+
+def weekly_difference_dataframes(dataframe, interval='15T'):
+    """Generates a dictionary of dataframes with each k,v pair representing a location and the difference between the two
+    datasource counts.
+
+    Parameters
+    ----------
+    dataframe : pandas DataFrame
+        Contains count and difference values for all locations
+
+    interval : str
+        The time interval to be represented in the resulting dataframe. The default in 15 minutes, which results
+        in 672 entries for every week
+
+    Returns
+    -------
+    dataframes : dict
+        A dictionary of DataFrames with each k,v pair representing a location and the difference between the two
+        datasource counts.
+    """
+    dataframes = {}
+    
+    for name, group in dataframe.groupby(['lat', 'lon']):
+        dataframes['location' + str(name)] = group.reset_index(level=['lat', 'lon']).drop(columns=['lat', 'lon'])
+    for location, counts in dataframes.items():
+        gaps_filled = counts[['difference']].asfreq(freq=interval, fill_value=0).reset_index(drop=False)
+        pivoted = pd.pivot_table(gaps_filled,
+                                 index=[gaps_filled['time'].dt.year, gaps_filled['time'].dt.week],
+                                 columns=gaps_filled.groupby(pd.Grouper(key='time', freq='W')).cumcount().add(1),
+                                 values=['difference'],
+                                 aggfunc='sum')
+        pivoted.index.names = ['year', 'week']
+        dataframes[location] = pivoted.iloc[1:-1] # removes likely incomplete first and last weeks
+
+    return dataframes
+
+def preprocess(dataframe):
+    spatial_grouped = spatial_grouping(dataframe)
+    occupancy = occupancy_level(spatial_grouped)
+    time_grouped = time_grouping(occupancy)
+    preprocessed = weekly_difference_dataframes(time_grouped)
+
+    return preprocessed
