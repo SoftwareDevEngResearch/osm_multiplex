@@ -21,7 +21,7 @@ THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 # modified LstmAutoEncoder class from reference for comparative time-series of mobility data
 class LstmAutoEncoder(object):
     model_name = 'lstm-auto-encoder'
-    VERBOSE = 1
+    VERBOSE = 0
 
     def __init__(self):
         self.model = None
@@ -33,12 +33,12 @@ class LstmAutoEncoder(object):
     @staticmethod
     def create_model(time_window_size, metric):
         model = Sequential()
-        model.add(LSTM(units=128, input_shape=(time_window_size, 1), return_sequences=False))
+        model.add(LSTM(units=128, input_shape=(time_window_size, 3), return_sequences=False))
 
         model.add(Dense(units=time_window_size, activation='linear'))
 
         model.compile(optimizer='adam', loss='mean_squared_error', metrics=[metric])
-        print(model.summary())
+        #print(model.summary())
         return model
 
     def load_model(self, model_dir_path):
@@ -64,7 +64,7 @@ class LstmAutoEncoder(object):
         return model_dir_path + '/' + LstmAutoEncoder.model_name + '-architecture.json'
 
     def fit(self, timeseries_dataset, model_dir_path, batch_size=None, epochs=None, validation_split=None, metric=None,
-            estimated_negative_sample_ratio=None):
+            std_dev_threshold=None):
         if batch_size is None:
             batch_size = 8
         if epochs is None:
@@ -73,31 +73,27 @@ class LstmAutoEncoder(object):
             validation_split = 0.2
         if metric is None:
             metric = 'mean_absolute_error'
-        if estimated_negative_sample_ratio is None:
-            estimated_negative_sample_ratio = 0.9
+        if std_dev_threshold is None:
+            std_dev_threshold = 1.5
 
         self.metric = metric
         self.time_window_size = timeseries_dataset.shape[1]
-
-        input_timeseries_dataset = np.expand_dims(timeseries_dataset, axis=2)
 
         weight_file_path = LstmAutoEncoder.get_weight_file(model_dir_path=model_dir_path)
         architecture_file_path = LstmAutoEncoder.get_architecture_file(model_dir_path)
         checkpoint = ModelCheckpoint(weight_file_path)
         self.model = LstmAutoEncoder.create_model(self.time_window_size, metric=self.metric)
         open(architecture_file_path, 'w').write(self.model.to_json())
-        self.model.fit(x=input_timeseries_dataset, y=timeseries_dataset,
+        self.model.fit(x=timeseries_dataset, y=timeseries_dataset[:,:,2],
                        batch_size=batch_size, epochs=epochs,
                        verbose=LstmAutoEncoder.VERBOSE, validation_split=validation_split,
                        callbacks=[checkpoint])
         self.model.save_weights(weight_file_path)
 
         scores = self.predict(timeseries_dataset)
-        scores.sort()
-        cut_point = int(estimated_negative_sample_ratio * len(scores))
-        self.threshold = scores[cut_point]
+        self.threshold = np.mean(scores) + std_dev_threshold * np.std(scores)
 
-        print('estimated threshold is ' + str(self.threshold))
+        #print('estimated threshold is ' + str(self.threshold))
 
         self.config = dict()
         self.config['time_window_size'] = self.time_window_size
@@ -107,9 +103,8 @@ class LstmAutoEncoder(object):
         np.save(config_file_path, self.config)
 
     def predict(self, timeseries_dataset):
-        input_timeseries_dataset = np.expand_dims(timeseries_dataset, axis=2)
-        target_timeseries_dataset = self.model.predict(x=input_timeseries_dataset)
-        dist = np.linalg.norm(timeseries_dataset - target_timeseries_dataset, axis=-1)
+        target_timeseries_dataset = self.model.predict(x=timeseries_dataset)
+        dist = np.linalg.norm(timeseries_dataset[:,:,2] - target_timeseries_dataset, axis=-1)
         return dist
 
     def anomaly(self, timeseries_dataset, threshold=None):
@@ -140,24 +135,38 @@ def anomaly_detect(data):
     reconstruction_dict = {}
     for location, dataframe in data.items():
         model_dir_path = os.path.join(THIS_DIR, './models')
-        print(location + ' processing')
-        np_data = dataframe.values
+        print(location)
+        samples = len(dataframe.index.codes[0])
+        timesteps = len(dataframe.columns.levels[1])
+        np_data_o1 = dataframe[['occupancy1']].values
+        np_data_o2 = dataframe[['occupancy2']].values
+        np_data_diff = np.abs(np_data_o1 - np_data_o2)
         scaler = MinMaxScaler()
-        np_data = scaler.fit_transform(np_data)
-        print(np_data.shape)
+        np_data_o1 = scaler.fit_transform(np_data_o1)
+        np_data_o2 = scaler.fit_transform(np_data_o2)
+        np_data_diff = scaler.fit_transform(np_data_diff)
+        np_data = np.stack((np_data_o1, np_data_o2, np_data_diff), axis=-1)
+        print(str(np_data.shape[0]) + ' weeks processing') 
 
         ae = LstmAutoEncoder()
 
         # fit the data and save model into model_dir_path
-        ae.fit(np_data[:, :], model_dir_path=model_dir_path, estimated_negative_sample_ratio=0.9)
+        ae.fit(np_data[:, :, :], model_dir_path=model_dir_path, std_dev_threshold=1.5)
 
         # load back the model saved in model_dir_path detect anomaly
         ae.load_model(model_dir_path)
-        anomaly_information = ae.anomaly(np_data[:, :])
-        reconstruction_error = []
+        anomaly_information = ae.anomaly(np_data[:, :, :])
+        reconstruction_error = {}
+        if ae.threshold == 0.0:
+            continue
+        else:
+            reconstruction_error['threshold'] = ae.threshold
+        years = list(dataframe.index.get_level_values(0))
+        weeks = list(dataframe.index.get_level_values(1))
         for idx, (is_anomaly, dist) in enumerate(anomaly_information):
-            print('# ' + str(idx) + ' is ' + ('abnormal' if is_anomaly else 'normal') + ' (dist: ' + str(dist) + ')')
-            reconstruction_error.append(dist)
-        reconstruction_dict[str(location) + "_" + str(ae.threshold)] = reconstruction_error
+            reconstruction_error[str(years[idx]) + ', ' +str(weeks[idx])] = [is_anomaly, dist]
+            if is_anomaly == True:
+                print(location + ' year ' + str(years[idx]) + ', week ' + str(weeks[idx]) + ' is anomalous')
+        reconstruction_dict[location] = reconstruction_error
 
     return reconstruction_dict
