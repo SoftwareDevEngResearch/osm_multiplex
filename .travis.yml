@@ -28,7 +28,6 @@ install:
   - conda install networkx
   - conda install numpy
   - conda install osmnx
-  - conda install pytables
   - conda install pandas
   - conda install scikit-learn
   - conda info -a
